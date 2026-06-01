@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Engine Room — Animated LLM Internals</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400&family=Newsreader:opsz,wght@6..72,400;6..72,500&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#080A0F; --bg2:#05060A; --surface:#11141C; --surface2:#171B25;
+    --ink:#EAE6DA; --muted:#94917F; --faint:#5E5C52;
+    --line:rgba(234,230,218,0.1); --line-strong:rgba(234,230,218,0.2);
+    --q:#F0B23E; --k:#4FD6C9; --v:#F47CA6;           /* Query / Key / Value */
+    --flow:#7CC4FF; --pos:#7FD17F; --neu:#F0B23E; --neg:#E86A6A;
+    --mono:'JetBrains Mono',ui-monospace,monospace;
+    --serif:'Newsreader',Georgia,serif; --display:'Fraunces',Georgia,serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:
+      radial-gradient(900px 500px at 85% -10%, rgba(240,178,62,0.06), transparent 60%),
+      radial-gradient(900px 500px at 10% 10%, rgba(79,214,201,0.06), transparent 60%),
+      var(--bg);
+    color:var(--ink);font-family:var(--serif);font-size:18px;line-height:1.7;
+    -webkit-font-smoothing:antialiased;overflow-x:hidden;
+  }
+  /* blueprint grid */
+  body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;opacity:0.5;
+    background-image:linear-gradient(rgba(124,196,255,0.035) 1px,transparent 1px),linear-gradient(90deg,rgba(124,196,255,0.035) 1px,transparent 1px);
+    background-size:42px 42px;}
+  ::selection{background:rgba(240,178,62,0.3)}
+
+  #progress{position:fixed;top:0;left:0;height:3px;width:0;z-index:60;background:linear-gradient(90deg,var(--q),var(--k),var(--v));}
+  nav{position:fixed;top:0;right:0;z-index:50;padding:18px 26px;font-family:var(--mono);font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:var(--faint);mix-blend-mode:difference}
+
+  .wrap{max-width:1120px;margin:0 auto;padding:0 28px;position:relative;z-index:2}
+
+  header{min-height:96vh;display:flex;flex-direction:column;justify-content:center;padding:80px 0 50px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:0.32em;text-transform:uppercase;color:var(--q);margin-bottom:22px;opacity:0;animation:rise .9s .1s forwards}
+  h1{font-family:var(--display);font-weight:600;font-size:clamp(2.8rem,8vw,6.2rem);line-height:0.95;letter-spacing:-0.02em;margin-bottom:24px}
+  h1 em{font-style:italic;color:var(--q);font-weight:400}
+  .lede{font-size:clamp(1.05rem,2vw,1.3rem);color:var(--muted);max-width:700px;line-height:1.6}
+  .lede strong{color:var(--ink);font-weight:500}
+  .modindex{display:flex;gap:14px;flex-wrap:wrap;margin-top:40px}
+  .modindex a{font-family:var(--mono);font-size:12px;letter-spacing:0.04em;color:var(--muted);text-decoration:none;
+    border:1px solid var(--line-strong);border-radius:30px;padding:9px 18px;transition:all .25s}
+  .modindex a:hover{color:var(--ink);border-color:var(--q);background:rgba(240,178,62,0.08)}
+  .modindex a b{color:var(--q)}
+  @keyframes rise{to{opacity:1;transform:none}}
+  .anim{opacity:0;transform:translateY(24px);animation:rise .9s forwards}
+  .d1{animation-delay:.2s}.d2{animation-delay:.35s}.d3{animation-delay:.5s}.d4{animation-delay:.65s}
+
+  section{padding:84px 0;border-top:1px solid var(--line)}
+  .step-no{font-family:var(--mono);font-size:13px;letter-spacing:0.18em;color:var(--q);text-transform:uppercase;margin-bottom:16px;display:flex;align-items:center;gap:14px}
+  .step-no::before{content:"";width:34px;height:1px;background:var(--q)}
+  h2{font-family:var(--display);font-weight:600;font-size:clamp(2rem,4.6vw,3.3rem);line-height:1.03;letter-spacing:-0.015em;margin-bottom:22px}
+  h2 em{font-style:italic;color:var(--q)}
+  h3{font-family:var(--display);font-weight:600;font-size:1.45rem;margin:38px 0 14px}
+  p{margin-bottom:18px;max-width:780px}
+  strong{color:var(--ink);font-weight:600}
+  code{font-family:var(--mono);font-size:0.85em;background:var(--surface);padding:2px 7px;border-radius:5px;color:var(--k);border:1px solid var(--line)}
+  .qc{color:var(--q)}.kc{color:var(--k)}.vc{color:var(--v)}
+
+  .reveal{opacity:0;transform:translateY(22px);transition:opacity .8s cubic-bezier(.2,.7,.2,1),transform .8s cubic-bezier(.2,.7,.2,1)}
+  .reveal.in{opacity:1;transform:none}
+
+  .legend{display:flex;gap:20px;flex-wrap:wrap;font-family:var(--mono);font-size:12px;color:var(--muted);margin:18px 0 8px}
+  .legend span{display:flex;align-items:center;gap:8px}
+  .legend i{width:13px;height:13px;border-radius:3px;display:inline-block}
+
+  /* ---- generic console / panel ---- */
+  .console{background:linear-gradient(180deg,var(--surface),var(--bg2));border:1px solid var(--line-strong);border-radius:16px;padding:26px;margin:30px 0;position:relative;overflow:hidden}
+  .console::before{content:"";position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--q),transparent);opacity:0.5}
+
+  .controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:22px}
+  .btn{font-family:var(--mono);font-size:12.5px;letter-spacing:0.04em;background:var(--surface2);color:var(--ink);
+    border:1px solid var(--line-strong);border-radius:8px;padding:10px 16px;cursor:pointer;transition:all .2s;display:flex;align-items:center;gap:8px}
+  .btn:hover{border-color:var(--q);color:var(--q)}
+  .btn.primary{background:var(--q);color:#1c1405;border-color:var(--q)}
+  .btn.primary:hover{filter:brightness(1.08)}
+  .stepname{font-family:var(--mono);font-size:13px;color:var(--q);letter-spacing:0.04em;margin-left:auto}
+  .stepname b{color:var(--ink)}
+
+  /* ============ MODULE A : ambient pipeline ============ */
+  .pipe{position:relative;padding:38px 0 18px}
+  .pipe-line{position:absolute;left:2%;right:2%;top:62px;height:2px;background:linear-gradient(90deg,var(--k),var(--flow),var(--v));opacity:0.35}
+  .stages{display:flex;justify-content:space-between;gap:6px;position:relative;z-index:2}
+  .stage{flex:1;text-align:center;font-family:var(--mono)}
+  .stage .dot{width:46px;height:46px;border-radius:50%;margin:0 auto 12px;background:var(--surface2);border:1.5px solid var(--line-strong);
+    display:flex;align-items:center;justify-content:center;font-size:16px;color:var(--muted);position:relative;animation:pulse 5.6s infinite}
+  .stage .nm{font-size:10.5px;color:var(--ink);letter-spacing:0.02em;line-height:1.3}
+  .stage .sh{font-size:9px;color:var(--faint);margin-top:3px}
+  .stage:nth-child(1) .dot{animation-delay:0s;color:var(--k);border-color:var(--k)}
+  .stage:nth-child(2) .dot{animation-delay:.7s}
+  .stage:nth-child(3) .dot{animation-delay:1.4s}
+  .stage:nth-child(4) .dot{animation-delay:2.1s;color:var(--q);border-color:var(--q)}
+  .stage:nth-child(5) .dot{animation-delay:2.8s}
+  .stage:nth-child(6) .dot{animation-delay:3.5s}
+  .stage:nth-child(7) .dot{animation-delay:4.2s;color:var(--v);border-color:var(--v)}
+  .stage:nth-child(8) .dot{animation-delay:4.9s;color:var(--pos);border-color:var(--pos)}
+  @keyframes pulse{0%,88%,100%{box-shadow:0 0 0 0 rgba(240,178,62,0);transform:scale(1)}6%{box-shadow:0 0 0 8px rgba(240,178,62,0.12);transform:scale(1.12);color:var(--ink)}}
+  .packet{position:absolute;top:52px;left:0;width:auto;z-index:3;font-family:var(--mono);font-size:10px;
+    background:var(--q);color:#1c1405;padding:3px 9px;border-radius:20px;white-space:nowrap;font-weight:700;
+    animation:travel 5.6s linear infinite;box-shadow:0 4px 16px rgba(240,178,62,0.3)}
+  .packet.p2{animation-delay:1.87s;background:var(--k);box-shadow:0 4px 16px rgba(79,214,201,0.3)}
+  .packet.p3{animation-delay:3.73s;background:var(--v);box-shadow:0 4px 16px rgba(244,124,166,0.3)}
+  @keyframes travel{0%{left:1%;opacity:0}5%{opacity:1}95%{opacity:1}100%{left:92%;opacity:0}}
+  .pipe.paused .dot,.pipe.paused .packet{animation-play-state:paused}
+  .pipe.paused .pipe-line{opacity:0.2}
+  @media(max-width:720px){.stage .nm{display:none}.stage .dot{width:34px;height:34px}.pipe-line{top:55px}.packet{top:46px}}
+
+  /* ============ MODULE B : attention engine ============ */
+  .attn-grid{display:grid;grid-template-columns:1.1fr 1.4fr;gap:26px;margin-top:8px}
+  @media(max-width:820px){.attn-grid{grid-template-columns:1fr}}
+  .tok-col{display:flex;flex-direction:column;gap:9px}
+  .tok-row{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-size:12px;transition:opacity .4s,transform .4s}
+  .tok-row .lbl{width:84px;color:var(--ink);text-align:right;white-space:nowrap}
+  .vecswatch{display:flex;gap:2px}
+  .vecswatch span{width:7px;height:18px;border-radius:2px;background:var(--muted);opacity:0.5}
+  .vecswatch.q span{background:var(--q)} .vecswatch.k span{background:var(--k)} .vecswatch.v span{background:var(--v)}
+  .qkv-head{display:grid;grid-template-columns:84px repeat(3,1fr);gap:8px;font-family:var(--mono);font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px}
+  .qkv-head .h-q{color:var(--q)}.qkv-head .h-k{color:var(--k)}.qkv-head .h-v{color:var(--v)}
+  .qkv-row{display:grid;grid-template-columns:84px repeat(3,1fr);gap:8px;align-items:center;margin:6px 0;font-family:var(--mono);font-size:11.5px;opacity:.25;transform:translateX(-6px);transition:all .45s}
+  .qkv-row.on{opacity:1;transform:none}
+  .qkv-row .lbl{text-align:right;color:var(--ink)}
+
+  .matrix{margin-top:4px}
+  .mhead{font-family:var(--mono);font-size:11px;color:var(--faint);margin-bottom:10px;letter-spacing:0.08em}
+  .grid{display:grid;grid-template-columns:78px repeat(5,1fr);gap:4px}
+  .gcell{aspect-ratio:1.7;border-radius:5px;display:flex;align-items:center;justify-content:center;
+    font-family:var(--mono);font-size:11px;background:var(--surface2);color:var(--muted);
+    border:1px solid var(--line);transition:all .35s}
+  .gcell.hdr{background:transparent;border:none;color:var(--faint);font-size:9.5px;align-items:center}
+  .gcell.hdr.col{writing-mode:initial}
+  .gcell.rowhdr{background:transparent;border:none;color:var(--ink);font-size:10px;justify-content:flex-end;padding-right:6px}
+  .gcell.filled{background:rgba(240,178,62,0.12);color:var(--ink);border-color:rgba(240,178,62,0.35)}
+  .gcell.masked{background:repeating-linear-gradient(45deg,#0d0f15,#0d0f15 4px,#11141c 4px,#11141c 8px);color:var(--faint);border-color:var(--line)}
+  .gcell.hot{background:rgba(79,214,201,0.18);border-color:var(--k);color:var(--ink);box-shadow:0 0 0 2px rgba(79,214,201,0.25)}
+  .gcell.win{background:rgba(127,209,127,0.22);border-color:var(--pos);color:#dfffdf}
+
+  .wrow{display:grid;grid-template-columns:78px 1fr 52px;gap:10px;align-items:center;margin:7px 0;font-family:var(--mono);font-size:11.5px;opacity:0;transform:translateY(8px);transition:all .4s}
+  .wrow.on{opacity:1;transform:none}
+  .wrow .lbl{text-align:right;color:var(--ink)}
+  .wtrack{height:20px;background:var(--bg2);border-radius:5px;overflow:hidden;border:1px solid var(--line)}
+  .wfill{height:100%;border-radius:4px;transition:width .6s cubic-bezier(.2,.7,.2,1);min-width:2px}
+  .wpct{text-align:right;color:var(--muted)}
+
+  .step-caption{margin-top:20px;font-family:var(--serif);font-size:15.5px;color:var(--muted);min-height:48px;border-left:3px solid var(--k);padding-left:18px}
+  .step-caption b{color:var(--ink)} .step-caption .eq{font-family:var(--mono);color:var(--q);font-size:13.5px}
+  .progress-dots{display:flex;gap:6px;margin-left:auto}
+  .progress-dots span{width:8px;height:8px;border-radius:50%;background:var(--line-strong);transition:all .3s}
+  .progress-dots span.act{background:var(--q);transform:scale(1.3)}
+
+  /* ============ MODULE C : scrubber ============ */
+  .scrub-stage{display:grid;grid-template-columns:1fr;gap:18px}
+  .focus{background:var(--bg2);border:1px solid var(--line-strong);border-radius:12px;padding:26px;min-height:200px;position:relative;overflow:hidden}
+  .focus .tag{font-family:var(--mono);font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:var(--q);margin-bottom:8px}
+  .focus h4{font-family:var(--display);font-size:1.7rem;font-weight:600;margin-bottom:12px;line-height:1.1}
+  .focus .shape{font-family:var(--mono);font-size:13px;color:var(--k);background:var(--surface);display:inline-block;padding:6px 12px;border-radius:7px;border:1px solid var(--line);margin-bottom:14px}
+  .focus p{font-size:15.5px;color:var(--muted);margin:0;max-width:680px}
+  .focus .glyph{position:absolute;right:24px;top:50%;transform:translateY(-50%);font-family:var(--mono);font-size:60px;color:rgba(240,178,62,0.1);font-weight:700}
+  .mini-pipe{display:flex;justify-content:space-between;gap:4px;margin:18px 0 6px}
+  .mini-node{flex:1;height:6px;border-radius:4px;background:var(--surface2);transition:all .35s}
+  .mini-node.done{background:var(--k)} .mini-node.act{background:var(--q);box-shadow:0 0 10px rgba(240,178,62,0.5)}
+  .mini-labels{display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--faint);letter-spacing:0.02em}
+  .mini-labels span{flex:1;text-align:center}
+  input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:5px;border-radius:5px;
+    background:var(--line-strong);outline:none;margin:20px 0 6px}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;background:var(--q);cursor:pointer;box-shadow:0 0 0 5px rgba(240,178,62,0.2)}
+  input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;background:var(--q);cursor:pointer;border:none;box-shadow:0 0 0 5px rgba(240,178,62,0.2)}
+
+  /* ---- internals cards ---- */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin-top:28px}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:22px 22px 24px;transition:border-color .3s,transform .3s}
+  .card:hover{border-color:var(--q);transform:translateY(-3px)}
+  .card .ic{font-family:var(--mono);font-size:11px;letter-spacing:0.12em;text-transform:uppercase;color:var(--q);margin-bottom:10px}
+  .card h5{font-family:var(--display);font-size:1.25rem;font-weight:600;margin-bottom:8px}
+  .card p{font-size:14.5px;color:var(--muted);margin:0;max-width:none}
+  .card .mono{font-family:var(--mono);color:var(--k);font-size:13px}
+
+  .note{border-left:3px solid var(--k);padding:6px 0 6px 22px;margin:26px 0;color:var(--muted);font-size:16px;max-width:760px}
+  .note b{color:var(--ink)}
+
+  footer{padding:84px 0 70px;border-top:1px solid var(--line);text-align:center}
+  footer .big{font-family:var(--display);font-style:italic;font-size:clamp(1.5rem,3.6vw,2.4rem);color:var(--ink);max-width:760px;margin:0 auto 22px;line-height:1.22}
+  footer .meta{font-family:var(--mono);font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:var(--faint)}
+</style>
+</head>
+<body>
+<div id="progress"></div>
+<nav>the engine room · animated</nav>
+
+<header>
+  <div class="wrap">
+    <div class="eyebrow">Animated LLM internals · three lenses</div>
+    <h1 class="anim d1">The <em>engine</em><br>room.</h1>
+    <p class="lede anim d2">Three ways to watch a transformer think — an <strong>ambient flow</strong> of the whole pipeline, a <strong>step-driven attention engine</strong> you can play frame by frame, and a <strong>scrubbable timeline</strong> of the entire forward pass. All traced on the same example: <em>"I think the vacation is okay."</em></p>
+    <div class="modindex anim d3">
+      <a href="#flow"><b>01</b> &nbsp;Ambient pipeline</a>
+      <a href="#attn"><b>02</b> &nbsp;Attention engine</a>
+      <a href="#scrub"><b>03</b> &nbsp;Scrub the forward pass</a>
+      <a href="#deep"><b>+</b> &nbsp;Deep internals</a>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<!-- ================= MODULE A ================= -->
+<section id="flow">
+  <div class="step-no">Lens 01 — Ambient flow</div>
+  <h2>The whole journey, <em>in motion</em>.</h2>
+  <p class="reveal">Start with the bird's-eye view. Data packets stream left to right through the eight stages of a forward pass; each station pulses as information passes through it. Nothing here is interactive yet — just watch the rhythm of the machine. Hit pause any time to freeze a moment.</p>
+
+  <div class="console reveal">
+    <div class="pipe" id="pipeA">
+      <div class="pipe-line"></div>
+      <div class="packet">prompt</div>
+      <div class="packet p2">tokens</div>
+      <div class="packet p3">vectors</div>
+      <div class="stages">
+        <div class="stage"><div class="dot">“”</div><div class="nm">Prompt</div><div class="sh">string</div></div>
+        <div class="stage"><div class="dot">#</div><div class="nm">Tokenize</div><div class="sh">(25,)</div></div>
+        <div class="stage"><div class="dot">▦</div><div class="nm">Embed</div><div class="sh">25×768</div></div>
+        <div class="stage"><div class="dot">+</div><div class="nm">Position</div><div class="sh">25×768</div></div>
+        <div class="stage"><div class="dot">⊕</div><div class="nm">Attention</div><div class="sh">25×64</div></div>
+        <div class="stage"><div class="dot">≋</div><div class="nm">FFN ×12</div><div class="sh">25×768</div></div>
+        <div class="stage"><div class="dot">⇲</div><div class="nm">Unembed</div><div class="sh">50,257</div></div>
+        <div class="stage"><div class="dot">✓</div><div class="nm">Softmax</div><div class="sh">"neutral"</div></div>
+      </div>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="playA">❚❚ Pause</button>
+      <span class="stepname">8 stations · continuous loop</span>
+    </div>
+  </div>
+  <div class="note reveal"><b>The shape that never changes.</b> Notice the stations from <i>Embed</i> through <i>FFN ×12</i> all read <code>25×768</code>. That invariance is the whole trick behind depth — because every block returns the same shape it received, you can stack them indefinitely. Only the ends differ: the tokenizer turns text into integers, and the unembedding fans a single vector out to 50,257 scores.</div>
+</section>
+
+<!-- ================= MODULE B ================= -->
+<section id="attn">
+  <div class="step-no">Lens 02 — The attention engine</div>
+  <h2>Watch attention <em>compute</em>.</h2>
+  <p class="reveal">Now zoom all the way in. This is one attention head working on a five-token slice of our sentence. Step through it — projections, scoring, masking, softmax, the weighted sum — and watch each number appear. Use <b>Play</b> to auto-advance, or <b>‹ ›</b> to drive it yourself. (Vectors are shown in low dimension for legibility; the real ones are 64-wide.)</p>
+
+  <div class="legend reveal">
+    <span><i style="background:var(--q)"></i> Query — "what am I looking for?"</span>
+    <span><i style="background:var(--k)"></i> Key — "what do I offer?"</span>
+    <span><i style="background:var(--v)"></i> Value — "what do I contribute?"</span>
+  </div>
+
+  <div class="console reveal">
+    <div class="attn-grid">
+      <!-- left: tokens & QKV -->
+      <div>
+        <div class="mhead">5-token slice · projections</div>
+        <div class="qkv-head"><span></span><span class="h-q">Q</span><span class="h-k">K</span><span class="h-v">V</span></div>
+        <div id="qkvBox"></div>
+      </div>
+      <!-- right: matrix / weights -->
+      <div>
+        <div class="mhead" id="matTitle">scores  S = Q·Kᵀ / √dₖ   (5 × 5)</div>
+        <div id="matBox"></div>
+      </div>
+    </div>
+
+    <div class="step-caption" id="attnCap"></div>
+
+    <div class="controls">
+      <button class="btn" id="prevB">‹ Prev</button>
+      <button class="btn primary" id="playB">▶ Play</button>
+      <button class="btn" id="nextB">Next ›</button>
+      <div class="progress-dots" id="dotsB"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= MODULE C ================= -->
+<section id="scrub">
+  <div class="step-no">Lens 03 — Scrub the forward pass</div>
+  <h2>Drive it <em>yourself</em>.</h2>
+  <p class="reveal">The presenter's tool. Drag the slider to move through all nine stages of the full forward pass; the focus panel shows what the tensor looks like and what's happening to it at each point, while the mini-pipeline marks your position. Press <b>Play</b> to let it run.</p>
+
+  <div class="console reveal">
+    <div class="focus" id="focus">
+      <div class="glyph" id="focusGlyph">01</div>
+      <div class="tag" id="focusTag"></div>
+      <h4 id="focusTitle"></h4>
+      <div class="shape" id="focusShape"></div>
+      <p id="focusDesc"></p>
+    </div>
+
+    <div class="mini-pipe" id="miniPipe"></div>
+    <div class="mini-labels">
+      <span>prompt</span><span>tokens</span><span>embed</span><span>+pos</span><span>attn</span><span>heads</span><span>FFN</span><span>×12</span><span>logits</span>
+    </div>
+
+    <input type="range" id="scrub" min="0" max="8" step="1" value="0">
+    <div class="controls">
+      <button class="btn" id="prevC">‹ Step back</button>
+      <button class="btn primary" id="playC">▶ Play</button>
+      <button class="btn" id="nextC">Step fwd ›</button>
+      <span class="stepname">stage <b id="scrubNo">1</b> / 9</span>
+    </div>
+  </div>
+</section>
+
+<!-- ================= DEEP INTERNALS ================= -->
+<section id="deep">
+  <div class="step-no">+ — The internals beneath the animation</div>
+  <h2>Six mechanisms worth <em>knowing</em>.</h2>
+  <p class="reveal">The animations show the flow. These cards explain <em>why</em> each piece is shaped the way it is — the conceptual machinery that the diagrams gloss over.</p>
+
+  <div class="cards reveal">
+    <div class="card">
+      <div class="ic">the highway</div>
+      <h5>Residual stream</h5>
+      <p>Every block <span class="mono">adds</span> its output back to its input rather than replacing it: <span class="mono">x ← x + sublayer(x)</span>. So the 768-d vector is a running ledger that each layer reads from and writes to. Information from layer 1 can survive untouched all the way to layer 12 — and gradients flow straight back during training, which is what makes 12+ layers trainable at all.</p>
+    </div>
+    <div class="card">
+      <div class="ic">why ÷√dₖ</div>
+      <h5>The scaling factor</h5>
+      <p>Dot products of two 64-d vectors have variance ∝ 64. Left unscaled, scores would be huge, the softmax would saturate to a near one-hot spike, and gradients would vanish. Dividing by <span class="mono">√64 = 8</span> keeps the score variance ≈ 1, so the softmax stays soft and the model can actually learn nuanced attention.</p>
+    </div>
+    <div class="card">
+      <div class="ic">memory, not math</div>
+      <h5>FFN as key–value store</h5>
+      <p>The feed-forward block — <span class="mono">768→3072→768</span> with GELU — behaves like a learned lookup table. The first matrix's 3,072 rows act as <i>keys</i> that detect patterns ("is this about sentiment?"); the second matrix's columns are <i>values</i> written into the residual stream when those keys fire. Most of a model's <i>facts</i> live here, not in attention.</p>
+    </div>
+    <div class="card">
+      <div class="ic">geometry</div>
+      <h5>LayerNorm</h5>
+      <p>Before each sublayer, the vector is re-centered to mean 0 and scaled to unit variance, then stretched by learned gain/bias. Geometrically it projects every token onto a sphere of fixed radius — removing "how loud" a vector is so the layer attends only to "which direction," i.e. <i>what</i> it means, keeping activations stable across depth.</p>
+    </div>
+    <div class="card">
+      <div class="ic">division of labor</div>
+      <h5>Head specialization</h5>
+      <p>The 12 heads aren't redundant. Trained networks reliably grow specialists: a previous-token head, a syntax head linking verbs to subjects, an <i>induction</i> head that copies repeated patterns, a head that tracks the <span class="mono">Sentiment:</span> cue. Twelve cheap 64-d views beat one expensive 768-d one.</p>
+    </div>
+    <div class="card">
+      <div class="ic">the loop</div>
+      <h5>Autoregression & the KV cache</h5>
+      <p>The model predicts <i>one</i> token, appends it, and re-runs. Naively that recomputes everything; in practice the Keys and Values of past tokens are <i>cached</i>, so each new token only computes its own Q/K/V and attends over the stored cache. That cache is why long contexts eat memory — it grows linearly with every token generated.</p>
+    </div>
+  </div>
+
+  <div class="note reveal"><b>Tying it back.</b> When you tune a prompt — adding a role, fencing input in delimiters, listing exact labels — you're nudging this exact machinery: shifting which heads fire, which FFN keys activate, and where the final softmax puts its mass. Prompt engineering is, mechanically, steering the forward pass you just watched.</div>
+</section>
+
+</div>
+
+<footer>
+  <div class="wrap">
+    <div class="big">"A transformer doesn't read a sentence — it lets every word vote on what every other word means."</div>
+    <div class="meta">the engine room · animated internals · GPT-2-class dims · 768 d · 12 heads · 12 layers</div>
+  </div>
+</footer>
+
+<script>
+/* ---------- progress + reveal ---------- */
+const prog=document.getElementById('progress');
+addEventListener('scroll',()=>{const h=document.documentElement;prog.style.width=(h.scrollTop/(h.scrollHeight-h.clientHeight)*100)+'%';},{passive:true});
+const io=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target);}}),{threshold:0.12,rootMargin:'0px 0px -8% 0px'});
+document.querySelectorAll('.reveal').forEach((el,i)=>{el.style.transitionDelay=(Math.min(i%3,2)*0.06)+'s';io.observe(el);});
+
+/* ---------- MODULE A : play/pause ---------- */
+const pipeA=document.getElementById('pipeA'), playA=document.getElementById('playA');
+let paused=false;
+playA.onclick=()=>{paused=!paused;pipeA.classList.toggle('paused',paused);playA.textContent=paused?'▶ Play':'❚❚ Pause';};
+
+/* ---------- MODULE B : attention engine ---------- */
+const TOK=['·I','·vacation','·is','·okay','Sentiment:'];
+// scaled scores (row = query token, col = key token); upper triangle is causally masked
+const S=[
+  [3.1, 0,   0,   0,   0  ],
+  [1.2, 3.5, 0,   0,   0  ],
+  [0.9, 2.1, 2.8, 0,   0  ],
+  [1.1, 2.4, 1.3, 3.9, 0  ],
+  [1.0, 2.5, 1.5, 4.0, 3.2]
+];
+const RAW=S.map(r=>r.map(v=>v?(v*8).toFixed(0):0)); // pre-scale (×√dₖ)
+// softmax of last row over all 5 (all visible to the last token)
+const lastRow=S[4];
+const ex=lastRow.map(v=>Math.exp(v)), sm=ex.reduce((a,b)=>a+b,0);
+const W=ex.map(e=>e/sm); // weights for last token
+const WCOL=['var(--muted)','var(--v)','var(--muted)','var(--pos)','var(--k)'];
+
+const STEPS=[
+  {t:'1 · Embedded tokens',
+   cap:'<b>Five token vectors enter the head.</b> Each is a 768-d row of X₀ (drawn here as a short swatch). Nothing has interacted yet — these are independent words.'},
+  {t:'2 · Project to Q, K, V',
+   cap:'<b>Three learned matrices split each token into a Query, a Key and a Value.</b> <span class="eq">Q=X·W_Q · K=X·W_K · V=X·W_V</span> — each 5×64 in the real model. Q asks, K answers, V carries the payload.'},
+  {t:'3 · Score every pair',
+   cap:'<b>Dot every Query with every Key.</b> <span class="eq">S = Q·Kᵀ</span> → a 5×5 grid. A big number means "this key is relevant to my query." These are the raw, unscaled scores.'},
+  {t:'4 · Scale by √dₖ',
+   cap:'<b>Divide every score by √64 = 8.</b> <span class="eq">S ← S/8</span>. This keeps the numbers tame so the upcoming softmax does not saturate into a hard spike.'},
+  {t:'5 · Causal mask',
+   cap:'<b>Blank out the future.</b> Token i may only attend to tokens ≤ i, so the upper triangle is set to −∞ before softmax. This is why generation can only ever look backward.'},
+  {t:'6 · Softmax the last row',
+   cap:'<b>Turn the last token\'s scores into weights that sum to 1.</b> <span class="eq">A=softmax(S)</span>. "Sentiment:" pours 55% of its attention onto <span style="color:var(--pos)">·okay</span> and 25% onto its own cue.'},
+  {t:'7 · Weighted sum of Values',
+   cap:'<b>Blend the Value vectors by those weights.</b> <span class="eq">out = A·V</span>. The last token\'s output is now mostly "okay" with a dash of context — it has officially "read" the sentence.'}
+];
+
+const qkvBox=document.getElementById('qkvBox'), matBox=document.getElementById('matBox'),
+      matTitle=document.getElementById('matTitle'), attnCap=document.getElementById('attnCap'),
+      dotsB=document.getElementById('dotsB');
+let stepB=0, timerB=null;
+
+function swatch(cls,n,seed){let s='';for(let i=0;i<n;i++){const h=(Math.sin(seed*9.7+i*2.3)+1)/2;s+=`<span style="opacity:${(0.35+h*0.6).toFixed(2)}"></span>`;}return `<div class="vecswatch ${cls}">${s}</div>`;}
+
+function renderQKV(step){
+  let html='';
+  TOK.forEach((t,i)=>{
+    const showQKV = step>=1;
+    html+=`<div class="qkv-row ${showQKV?'on':''}">
+      <span class="lbl">${t}</span>
+      ${showQKV?swatch('q',6,i+1):swatch('',6,i+1)}
+      ${showQKV?swatch('k',6,i+5):'<div class="vecswatch"></div>'}
+      ${showQKV?swatch('v',6,i+9):'<div class="vecswatch"></div>'}
+    </div>`;
+  });
+  // step 0: just embeddings, single column
+  if(step===0){
+    html='';
+    TOK.forEach((t,i)=>{html+=`<div class="qkv-row on"><span class="lbl">${t}</span>${swatch('',6,i+1)}<div class="vecswatch"></div><div class="vecswatch"></div></div>`;});
+  }
+  qkvBox.innerHTML=html;
+}
+
+function renderMatrix(step){
+  // weights view for steps 6,7
+  if(step>=5){
+    matTitle.innerHTML='attention weights · last token "Sentiment:"  (row sums to 1.0)';
+    let html='';
+    TOK.forEach((t,i)=>{
+      const on = step>=5;
+      const w = W[i];
+      html+=`<div class="wrow ${on?'on':''}" style="transition-delay:${i*0.08}s">
+        <span class="lbl">${t}</span>
+        <div class="wtrack"><div class="wfill" style="width:${(w*100).toFixed(1)}%;background:${WCOL[i]}"></div></div>
+        <span class="wpct">${(w*100).toFixed(0)}%</span>
+      </div>`;
+    });
+    if(step>=6){
+      html+=`<div style="margin-top:14px;font-family:var(--mono);font-size:12px;color:var(--v)">out = Σ wᵢ·Vᵢ &nbsp;→&nbsp; <span style="color:var(--ink)">enriched 64-d vector for "Sentiment:"</span></div>`;
+    }
+    matBox.innerHTML=html;
+    return;
+  }
+  // grid view for steps 2..4 (and empty-ish for 0,1)
+  matTitle.innerHTML = step<2 ? 'scores  S = Q·Kᵀ / √dₖ   (5 × 5)'
+                     : step===2 ? 'raw scores  S = Q·Kᵀ   (5 × 5)'
+                     : step===3 ? 'scaled scores  S ← S / √64'
+                     : 'after causal mask  (future = −∞)';
+  let g='<div class="grid">';
+  g+='<div class="gcell hdr"></div>';
+  TOK.forEach(t=>g+=`<div class="gcell hdr col">${t.replace('·','')}</div>`);
+  TOK.forEach((rt,r)=>{
+    g+=`<div class="gcell rowhdr">${rt.replace('·','')}</div>`;
+    TOK.forEach((ct,c)=>{
+      const masked = c>r;
+      let cls='gcell', txt='';
+      if(step<2){ txt=''; }
+      else if(masked && step>=4){ cls+=' masked'; txt='−∞'; }
+      else if(!masked){
+        cls+=' filled';
+        txt = step===2 ? RAW[r][c] : S[r][c].toFixed(1);
+        if(step>=4 && r===4) cls+=' hot';
+      } else { txt = step===2?RAW[r][c]:S[r][c].toFixed(1); cls+=' filled'; }
+      const delay = step===2 ? ((r*5+c)*0.03).toFixed(2) : 0;
+      g+=`<div class="${cls}" style="transition-delay:${delay}s">${txt}</div>`;
+    });
+  });
+  g+='</div>';
+  matBox.innerHTML=g;
+}
+
+function renderB(){
+  renderQKV(stepB); renderMatrix(stepB);
+  attnCap.innerHTML=STEPS[stepB].cap;
+  dotsB.innerHTML=STEPS.map((_,i)=>`<span class="${i===stepB?'act':''}"></span>`).join('');
+}
+function go(n){stepB=(n+STEPS.length)%STEPS.length;renderB();}
+document.getElementById('prevB').onclick=()=>{stopB();go(stepB-1);};
+document.getElementById('nextB').onclick=()=>{stopB();go(stepB+1);};
+const playB=document.getElementById('playB');
+function stopB(){if(timerB){clearInterval(timerB);timerB=null;playB.textContent='▶ Play';}}
+playB.onclick=()=>{
+  if(timerB){stopB();return;}
+  playB.textContent='❚❚ Pause';
+  timerB=setInterval(()=>{ if(stepB>=STEPS.length-1){stepB=-1;} go(stepB+1); },1700);
+};
+renderB();
+
+/* ---------- MODULE C : scrubber ---------- */
+const STAGES=[
+  {tag:'input',title:'The raw prompt',shape:'a plain string',glyph:'01',
+   d:'"Classify the text… Sentiment:" arrives as characters. The model has zero understanding yet — this is just bytes waiting to be cut into pieces.'},
+  {tag:'tokenize',title:'Sub-word tokens',shape:'ids ∈ (25,)',glyph:'02',
+   d:'Byte-Pair Encoding chops the string into 25 vocabulary pieces and replaces each with an integer ID. "vacation" is one token; "Sentiment" splits into "·Sent"+"iment".'},
+  {tag:'embed',title:'Token embeddings',shape:'X ∈ ℝ²⁵ˣ⁷⁶⁸',glyph:'03',
+   d:'Each ID indexes one row of the 50,257×768 embedding table. Now every token is a learned 768-d vector — and similar words already sit near each other in this space.'},
+  {tag:'position',title:'Add position',shape:'X₀ ∈ ℝ²⁵ˣ⁷⁶⁸',glyph:'04',
+   d:'Attention is order-blind, so a positional vector is added to each token. "okay" now knows it is the 20th word, not just that it is "okay".'},
+  {tag:'attention',title:'Self-attention',shape:'per head: 25×64',glyph:'05',
+   d:'Every token forms a Query, Key and Value, scores itself against all earlier tokens, and pulls in a weighted blend. Information finally moves between words. The last token reads "okay".'},
+  {tag:'multi-head',title:'Twelve heads → mix',shape:'concat → 25×768',glyph:'06',
+   d:'Twelve heads run in parallel, each in its own 64-d subspace catching a different relationship. Their outputs are concatenated and projected back to 768 by W_O.'},
+  {tag:'feed-forward',title:'FFN · think per-token',shape:'768→3072→768',glyph:'07',
+   d:'Each token is expanded to 3,072 dims, passed through GELU, and contracted back — a learned key-value memory that processes each position independently. Residual + LayerNorm wrap it.'},
+  {tag:'depth',title:'Stack ×12',shape:'X_final ∈ ℝ²⁵ˣ⁷⁶⁸',glyph:'08',
+   d:'Because shape is preserved, the block repeats 12 times. Early layers catch grammar, late layers sharpen the prediction. The last token\'s vector becomes a summary of "what comes next?".'},
+  {tag:'output',title:'Logits → softmax',shape:'50,257 → "neutral"',glyph:'09',
+   d:'The last vector is projected by Eᵀ to one score per vocabulary token, then softmaxed. neutral 68.9% beats positive 30.9% — the model emits "neutral". Append it, and the loop could continue.'}
+];
+const scrub=document.getElementById('scrub'), miniPipe=document.getElementById('miniPipe'), scrubNo=document.getElementById('scrubNo');
+miniPipe.innerHTML=STAGES.map(()=>'<div class="mini-node"></div>').join('');
+const nodes=[...miniPipe.children];
+function renderC(i){
+  const s=STAGES[i];
+  document.getElementById('focusTag').textContent=s.tag;
+  document.getElementById('focusTitle').textContent=s.title;
+  document.getElementById('focusShape').textContent=s.shape;
+  document.getElementById('focusDesc').textContent=s.d;
+  document.getElementById('focusGlyph').textContent=s.glyph;
+  scrubNo.textContent=i+1;
+  nodes.forEach((n,j)=>{n.className='mini-node'+(j<i?' done':j===i?' act':'');});
+}
+scrub.oninput=()=>{stopC();renderC(+scrub.value);};
+document.getElementById('prevC').onclick=()=>{stopC();scrub.value=Math.max(0,+scrub.value-1);renderC(+scrub.value);};
+document.getElementById('nextC').onclick=()=>{stopC();scrub.value=Math.min(8,+scrub.value+1);renderC(+scrub.value);};
+const playC=document.getElementById('playC');let timerC=null;
+function stopC(){if(timerC){clearInterval(timerC);timerC=null;playC.textContent='▶ Play';}}
+playC.onclick=()=>{
+  if(timerC){stopC();return;}
+  playC.textContent='❚❚ Pause';
+  timerC=setInterval(()=>{let v=+scrub.value;v=v>=8?0:v+1;scrub.value=v;renderC(v);},1900);
+};
+renderC(0);
+</script>
+</body>
+</html>

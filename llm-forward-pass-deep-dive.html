@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inside the Forward Pass — How an LLM Reads a Prompt</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0E0F13;
+    --bg2:#0a0b0e;
+    --surface:#15171F;
+    --surface2:#1B1E28;
+    --ink:#ECE6D9;
+    --muted:#9C988C;
+    --faint:#6A6760;
+    --line:rgba(236,230,217,0.12);
+    --line-strong:rgba(236,230,217,0.22);
+    /* Q K V color coding, used everywhere */
+    --q:#E8A23D;   /* Query  — gold   */
+    --k:#54D1C4;   /* Key    — teal   */
+    --v:#F47CA6;   /* Value  — rose   */
+    --pos:#7FD17F; /* positive */
+    --neu:#E8A23D; /* neutral  */
+    --neg:#E86A6A; /* negative */
+    --mono:'JetBrains Mono',ui-monospace,monospace;
+    --serif:'Newsreader',Georgia,serif;
+    --display:'Fraunces',Georgia,serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(232,162,61,0.07), transparent 60%),
+      radial-gradient(900px 500px at -10% 30%, rgba(84,209,196,0.06), transparent 55%),
+      var(--bg);
+    color:var(--ink);
+    font-family:var(--serif);
+    font-size:18px;
+    line-height:1.7;
+    -webkit-font-smoothing:antialiased;
+    overflow-x:hidden;
+  }
+  /* grain */
+  body::before{
+    content:"";position:fixed;inset:0;pointer-events:none;z-index:1;opacity:0.035;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+  ::selection{background:rgba(232,162,61,0.3);color:var(--ink)}
+
+  /* ---- progress bar ---- */
+  #progress{position:fixed;top:0;left:0;height:3px;width:0;z-index:50;
+    background:linear-gradient(90deg,var(--q),var(--k),var(--v));}
+
+  /* ---- nav ---- */
+  nav{position:fixed;top:0;right:0;z-index:40;padding:18px 26px;font-family:var(--mono);
+      font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:var(--faint);
+      mix-blend-mode:difference;}
+
+  .wrap{max-width:1080px;margin:0 auto;padding:0 28px;position:relative;z-index:2}
+
+  /* ---- hero ---- */
+  header{min-height:100vh;display:flex;flex-direction:column;justify-content:center;
+         padding:80px 0 60px;position:relative}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:0.34em;text-transform:uppercase;
+           color:var(--q);margin-bottom:28px;opacity:0;animation:rise .9s .1s forwards}
+  h1{font-family:var(--display);font-weight:600;font-size:clamp(2.6rem,7vw,5.4rem);
+     line-height:0.98;letter-spacing:-0.02em;margin-bottom:30px;font-optical-sizing:auto}
+  h1 em{font-style:italic;color:var(--q);font-weight:500}
+  .lede{font-size:clamp(1.05rem,2vw,1.32rem);color:var(--muted);max-width:680px;
+        font-weight:400;line-height:1.6}
+  .lede strong{color:var(--ink);font-weight:500}
+  .hero-prompt{margin-top:46px;max-width:720px;border:1px solid var(--line-strong);
+    border-radius:10px;background:linear-gradient(180deg,var(--surface),var(--bg2));
+    font-family:var(--mono);font-size:14.5px;line-height:1.85;color:var(--ink);
+    padding:22px 26px;position:relative;overflow:hidden}
+  .hero-prompt .tag{position:absolute;top:0;right:0;background:var(--q);color:#1a1206;
+    font-size:10px;font-weight:700;letter-spacing:0.12em;padding:4px 12px;
+    border-bottom-left-radius:8px;text-transform:uppercase}
+  .hero-prompt .c-instr{color:var(--k)}
+  .hero-prompt .c-text{color:var(--ink)}
+  .hero-prompt .c-cursor{color:var(--q)}
+  .scrollcue{margin-top:54px;font-family:var(--mono);font-size:11px;letter-spacing:0.2em;
+    text-transform:uppercase;color:var(--faint);display:flex;align-items:center;gap:12px}
+  .scrollcue .bar{width:46px;height:1px;background:var(--faint);position:relative;overflow:hidden}
+  .scrollcue .bar::after{content:"";position:absolute;inset:0;background:var(--q);
+    animation:sweep 2.2s infinite}
+  @keyframes sweep{0%{transform:translateX(-100%)}60%,100%{transform:translateX(100%)}}
+  @keyframes rise{to{opacity:1;transform:none}}
+  .anim{opacity:0;transform:translateY(26px);animation:rise .9s forwards}
+  .d1{animation-delay:.25s}.d2{animation-delay:.4s}.d3{animation-delay:.55s}.d4{animation-delay:.7s}
+
+  /* ---- config strip ---- */
+  .config{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1px;
+    background:var(--line);border:1px solid var(--line);border-radius:10px;overflow:hidden;
+    margin-top:40px}
+  .config div{background:var(--bg);padding:16px 18px}
+  .config .k{font-family:var(--mono);font-size:10.5px;letter-spacing:0.12em;text-transform:uppercase;
+    color:var(--faint);margin-bottom:6px}
+  .config .v{font-family:var(--mono);font-size:20px;color:var(--q);font-weight:500}
+  .config .v small{font-size:12px;color:var(--muted)}
+
+  /* ---- sections ---- */
+  section{padding:90px 0;border-top:1px solid var(--line)}
+  .step-no{font-family:var(--mono);font-size:13px;letter-spacing:0.18em;color:var(--q);
+    text-transform:uppercase;margin-bottom:16px;display:flex;align-items:center;gap:14px}
+  .step-no::before{content:"";width:34px;height:1px;background:var(--q)}
+  h2{font-family:var(--display);font-weight:600;font-size:clamp(1.9rem,4vw,3rem);
+     line-height:1.04;letter-spacing:-0.015em;margin-bottom:24px}
+  h2 em{font-style:italic;color:var(--q)}
+  h3{font-family:var(--display);font-weight:600;font-size:1.4rem;margin:42px 0 16px;
+     letter-spacing:-0.01em}
+  p{margin-bottom:18px;max-width:760px}
+  p.reveal,figure.reveal,.eq.reveal,.callout.reveal,.note.reveal{opacity:0;transform:translateY(24px);
+    transition:opacity .8s cubic-bezier(.2,.7,.2,1),transform .8s cubic-bezier(.2,.7,.2,1)}
+  .reveal.in{opacity:1;transform:none}
+  strong{color:var(--ink);font-weight:600}
+  em.term{font-style:normal;color:var(--q);font-weight:500}
+  code{font-family:var(--mono);font-size:0.86em;background:var(--surface);padding:2px 7px;
+    border-radius:5px;color:var(--k);border:1px solid var(--line)}
+
+  /* equation blocks */
+  .eq{font-family:var(--mono);background:linear-gradient(180deg,var(--surface),var(--bg2));
+    border:1px solid var(--line-strong);border-left:3px solid var(--q);border-radius:8px;
+    padding:22px 26px;margin:26px 0;font-size:16px;line-height:2.1;overflow-x:auto}
+  .eq .lbl{display:block;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;
+    color:var(--faint);margin-bottom:12px}
+  .eq .big{font-size:19px}
+  .dim{color:var(--muted);font-size:13px}
+  sub{font-size:0.7em}sup{font-size:0.7em}
+  .qc{color:var(--q)}.kc{color:var(--k)}.vc{color:var(--v)}
+
+  /* callout / note */
+  .callout{background:var(--surface);border:1px solid var(--line);border-radius:10px;
+    padding:24px 28px;margin:30px 0}
+  .callout .h{font-family:var(--mono);font-size:11px;letter-spacing:0.16em;text-transform:uppercase;
+    color:var(--k);margin-bottom:10px}
+  .note{border-left:3px solid var(--k);padding:6px 0 6px 22px;margin:26px 0;color:var(--muted);
+    font-size:16px;max-width:740px}
+  .note b{color:var(--ink)}
+
+  figure{margin:38px 0}
+  figcaption{font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:14px;
+    letter-spacing:0.04em;text-align:center}
+  svg{display:block;width:100%;height:auto;overflow:visible}
+  .svgcard{background:linear-gradient(180deg,rgba(27,30,40,0.5),rgba(10,11,14,0.4));
+    border:1px solid var(--line);border-radius:14px;padding:30px 24px}
+
+  /* token chips */
+  .tokens{display:flex;flex-wrap:wrap;gap:9px;margin:26px 0}
+  .tok{font-family:var(--mono);font-size:13px;border:1px solid var(--line-strong);
+    border-radius:7px;overflow:hidden;background:var(--surface)}
+  .tok .t{padding:7px 11px;display:block;color:var(--ink);white-space:pre}
+  .tok .id{display:block;background:var(--bg2);padding:4px 11px;font-size:10.5px;color:var(--q);
+    border-top:1px solid var(--line);text-align:center}
+  .tok.sp .t{color:var(--faint)}
+
+  table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:13.5px;margin:24px 0}
+  th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line)}
+  th{color:var(--faint);font-size:11px;letter-spacing:0.1em;text-transform:uppercase;font-weight:500}
+  td{color:var(--ink)}
+  tr td:first-child{color:var(--muted)}
+
+  /* interactive softmax */
+  .lab{background:linear-gradient(180deg,var(--surface),var(--bg2));border:1px solid var(--line-strong);
+    border-radius:14px;padding:30px;margin:34px 0}
+  .lab .head{font-family:var(--mono);font-size:11px;letter-spacing:0.16em;text-transform:uppercase;
+    color:var(--q);margin-bottom:6px}
+  .lab h4{font-family:var(--display);font-size:1.3rem;font-weight:600;margin-bottom:18px}
+  .slider-row{display:flex;align-items:center;gap:18px;margin:22px 0 8px;font-family:var(--mono);
+    font-size:13px;color:var(--muted)}
+  input[type=range]{-webkit-appearance:none;appearance:none;flex:1;height:4px;border-radius:4px;
+    background:var(--line-strong);outline:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;
+    background:var(--q);cursor:pointer;box-shadow:0 0 0 4px rgba(232,162,61,0.2)}
+  input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:var(--q);
+    cursor:pointer;border:none;box-shadow:0 0 0 4px rgba(232,162,61,0.2)}
+  .tval{font-family:var(--mono);color:var(--q);font-size:16px;min-width:54px;text-align:right}
+  .bars{margin-top:20px}
+  .barrow{display:grid;grid-template-columns:90px 1fr 70px;align-items:center;gap:14px;margin:13px 0;
+    font-family:var(--mono);font-size:13px}
+  .barrow .name{color:var(--ink)}
+  .bartrack{height:26px;background:var(--bg2);border-radius:6px;overflow:hidden;border:1px solid var(--line)}
+  .barfill{height:100%;border-radius:5px;transition:width .35s cubic-bezier(.2,.7,.2,1);min-width:2px}
+  .barpct{text-align:right;color:var(--q)}
+
+  /* footer */
+  footer{padding:90px 0 70px;border-top:1px solid var(--line);text-align:center}
+  footer .big{font-family:var(--display);font-style:italic;font-size:clamp(1.5rem,3.5vw,2.4rem);
+    color:var(--ink);max-width:740px;margin:0 auto 24px;line-height:1.25}
+  footer .meta{font-family:var(--mono);font-size:11px;letter-spacing:0.14em;text-transform:uppercase;
+    color:var(--faint)}
+
+  .legend{display:flex;gap:22px;flex-wrap:wrap;font-family:var(--mono);font-size:12px;
+    color:var(--muted);margin:8px 0 26px}
+  .legend span{display:flex;align-items:center;gap:8px}
+  .legend i{width:13px;height:13px;border-radius:3px;display:inline-block}
+
+  @media(max-width:640px){
+    body{font-size:16.5px}
+    .barrow{grid-template-columns:74px 1fr 56px}
+    .eq{font-size:14px}
+  }
+</style>
+</head>
+<body>
+<div id="progress"></div>
+<nav>forward pass · annotated</nav>
+
+<header>
+  <div class="wrap">
+    <div class="eyebrow">A field guide to LLM internals</div>
+    <h1 class="anim d1">How a language model<br><em>reads</em> your prompt.</h1>
+    <p class="lede anim d2">Follow a single prompt all the way through a transformer — from raw characters to a probability over the next word. Every <strong>matrix shape</strong>, every <strong>softmax</strong>, every <strong>attention weight</strong>, traced on one real example.</p>
+
+    <div class="hero-prompt anim d3">
+      <span class="tag">the input</span>
+<span class="c-instr">Classify the text into neutral, negative, or positive.</span>
+<span class="c-text">Text: I think the vacation is okay.</span>
+<span class="c-text">Sentiment: </span><span class="c-cursor">▮</span>
+    </div>
+
+    <div class="scrollcue anim d4"><span class="bar"></span> scroll to begin the trace</div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<!-- ================= BIG PICTURE ================= -->
+<section id="overview">
+  <div class="step-no">Step 00 — The shape of the journey</div>
+  <h2>One prompt, <em>nine</em> transformations.</h2>
+  <p class="reveal">An LLM does not "understand" text the way you do. It runs a fixed sequence of matrix operations — the <em class="term">forward pass</em> — that turns a string into a vector of probabilities over its entire vocabulary. The word it predicts becomes the next token, and the loop repeats. Everything below is one trip through that machine.</p>
+
+  <p class="reveal">We will trace the journey on a concrete configuration — the dimensions of a GPT-2-class model — so every shape is a real number you can hold onto:</p>
+
+  <div class="config reveal">
+    <div><div class="k">vocabulary</div><div class="v">50,257<small> tokens</small></div></div>
+    <div><div class="k">d<sub>model</sub></div><div class="v">768<small> dims</small></div></div>
+    <div><div class="k">layers</div><div class="v">12<small> blocks</small></div></div>
+    <div><div class="k">heads</div><div class="v">12<small> × 64</small></div></div>
+    <div><div class="k">FFN width</div><div class="v">3,072<small> 4×</small></div></div>
+    <div><div class="k">context</div><div class="v">1,024<small> max</small></div></div>
+  </div>
+
+  <figure class="reveal">
+    <div class="svgcard">
+    <svg viewBox="0 0 1000 250" role="img" aria-label="End to end pipeline">
+      <defs>
+        <marker id="arr" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="#9C988C"/>
+        </marker>
+        <linearGradient id="flow" x1="0" x2="1">
+          <stop offset="0" stop-color="#E8A23D"/><stop offset="0.5" stop-color="#54D1C4"/>
+          <stop offset="1" stop-color="#F47CA6"/>
+        </linearGradient>
+      </defs>
+      <!-- moving flow line -->
+      <line x1="40" y1="55" x2="960" y2="55" stroke="url(#flow)" stroke-width="2" opacity="0.5"
+        stroke-dasharray="6 10"><animate attributeName="stroke-dashoffset" from="160" to="0" dur="3s" repeatCount="indefinite"/></line>
+
+      <g font-family="JetBrains Mono" font-size="12.5" text-anchor="middle">
+        <!-- nodes -->
+        <g>
+          <rect x="20" y="80" width="120" height="70" rx="9" fill="#15171F" stroke="#54D1C4" stroke-width="1.2"/>
+          <text x="80" y="108" fill="#ECE6D9">Prompt</text>
+          <text x="80" y="128" fill="#6A6760" font-size="10.5">raw string</text>
+        </g>
+        <g>
+          <rect x="170" y="80" width="120" height="70" rx="9" fill="#15171F" stroke="#54D1C4" stroke-width="1.2"/>
+          <text x="230" y="103" fill="#ECE6D9">Tokenizer</text>
+          <text x="230" y="121" fill="#6A6760" font-size="10.5">BPE split</text>
+          <text x="230" y="137" fill="#E8A23D" font-size="10.5">→ token IDs</text>
+        </g>
+        <g>
+          <rect x="320" y="80" width="120" height="70" rx="9" fill="#15171F" stroke="#54D1C4" stroke-width="1.2"/>
+          <text x="380" y="103" fill="#ECE6D9">Embedding</text>
+          <text x="380" y="121" fill="#6A6760" font-size="10.5">lookup + pos</text>
+          <text x="380" y="137" fill="#E8A23D" font-size="10.5">T × 768</text>
+        </g>
+        <g>
+          <rect x="470" y="68" width="170" height="94" rx="9" fill="#1B1E28" stroke="#E8A23D" stroke-width="1.4"/>
+          <text x="555" y="96" fill="#ECE6D9">Transformer ×12</text>
+          <text x="555" y="116" fill="#6A6760" font-size="10">attention + FFN</text>
+          <text x="555" y="133" fill="#6A6760" font-size="10">+ norm + residual</text>
+          <text x="555" y="150" fill="#E8A23D" font-size="10.5">T × 768</text>
+        </g>
+        <g>
+          <rect x="670" y="80" width="120" height="70" rx="9" fill="#15171F" stroke="#F47CA6" stroke-width="1.2"/>
+          <text x="730" y="103" fill="#ECE6D9">Unembed</text>
+          <text x="730" y="121" fill="#6A6760" font-size="10.5">× Eᵀ</text>
+          <text x="730" y="137" fill="#F47CA6" font-size="10.5">→ 50,257 logits</text>
+        </g>
+        <g>
+          <rect x="820" y="80" width="120" height="70" rx="9" fill="#15171F" stroke="#F47CA6" stroke-width="1.2"/>
+          <text x="880" y="103" fill="#ECE6D9">Softmax</text>
+          <text x="880" y="121" fill="#6A6760" font-size="10.5">→ probs</text>
+          <text x="880" y="137" fill="#7FD17F" font-size="10.5">"neutral"</text>
+        </g>
+        <!-- arrows -->
+        <g stroke="#9C988C" stroke-width="1.3" marker-end="url(#arr)" fill="none">
+          <line x1="142" y1="115" x2="166" y2="115"/>
+          <line x1="292" y1="115" x2="316" y2="115"/>
+          <line x1="442" y1="115" x2="466" y2="115"/>
+          <line x1="642" y1="115" x2="666" y2="115"/>
+          <line x1="792" y1="115" x2="816" y2="115"/>
+        </g>
+        <!-- recurrence -->
+        <path d="M880 152 L880 200 L80 200 L80 152" stroke="#54D1C4" stroke-width="1.2" fill="none"
+          stroke-dasharray="4 5" marker-end="url(#arr)"/>
+        <text x="480" y="218" fill="#54D1C4" font-size="10.5">append predicted token → feed the whole sequence back in (autoregression)</text>
+      </g>
+    </svg>
+    </div>
+    <figcaption>The full forward pass. Each box is a section below. T = number of tokens in the prompt.</figcaption>
+  </figure>
+
+  <div class="note reveal"><b>A note on "agents."</b> An LLM <i>agent</i> (the kind you orchestrate in Dify or via MCP) is this forward pass wrapped in a loop with tools, memory, and a controller. The model itself only ever does what follows — predict the next token. The "agentic" intelligence lives in how you route those predictions back into actions. Understanding the box above is understanding the engine inside every agent.</div>
+</section>
+
+<!-- ================= TOKENIZATION ================= -->
+<section id="tokenize">
+  <div class="step-no">Step 01 — Tokenization</div>
+  <h2>Text becomes <em>integers</em>.</h2>
+  <p class="reveal">The model has no notion of letters or words. Before anything else, the tokenizer chops the string into <em class="term">tokens</em> — sub-word chunks drawn from a fixed vocabulary of 50,257 entries — and replaces each with its integer ID. GPT-style models use <em class="term">Byte-Pair Encoding (BPE)</em>: common words become a single token, rarer words split into pieces, and a leading space is glued onto the token that follows it (shown here as <code>·</code>).</p>
+
+  <p class="reveal">Our prompt tokenizes to roughly the sequence below. (IDs are illustrative of GPT-2's BPE table; the exact split depends on the tokenizer.)</p>
+
+  <div class="tokens reveal">
+    <span class="tok"><span class="t">Class</span><span class="id">9487</span></span>
+    <span class="tok"><span class="t">ify</span><span class="id">1958</span></span>
+    <span class="tok"><span class="t">·the</span><span class="id">262</span></span>
+    <span class="tok"><span class="t">·text</span><span class="id">2420</span></span>
+    <span class="tok"><span class="t">·into</span><span class="id">656</span></span>
+    <span class="tok"><span class="t">·neutral</span><span class="id">8500</span></span>
+    <span class="tok sp"><span class="t">,</span><span class="id">11</span></span>
+    <span class="tok"><span class="t">·negative</span><span class="id">4633</span></span>
+    <span class="tok sp"><span class="t">,</span><span class="id">11</span></span>
+    <span class="tok"><span class="t">·or</span><span class="id">393</span></span>
+    <span class="tok"><span class="t">·positive</span><span class="id">3967</span></span>
+    <span class="tok sp"><span class="t">.</span><span class="id">13</span></span>
+    <span class="tok"><span class="t">·Text</span><span class="id">8255</span></span>
+    <span class="tok sp"><span class="t">:</span><span class="id">25</span></span>
+    <span class="tok"><span class="t">·I</span><span class="id">314</span></span>
+    <span class="tok"><span class="t">·think</span><span class="id">892</span></span>
+    <span class="tok"><span class="t">·the</span><span class="id">262</span></span>
+    <span class="tok"><span class="t">·vacation</span><span class="id">14600</span></span>
+    <span class="tok"><span class="t">·is</span><span class="id">318</span></span>
+    <span class="tok"><span class="t">·okay</span><span class="id">8788</span></span>
+    <span class="tok sp"><span class="t">.</span><span class="id">13</span></span>
+    <span class="tok"><span class="t">·Sent</span><span class="id">11352</span></span>
+    <span class="tok"><span class="t">iment</span><span class="id">3681</span></span>
+    <span class="tok sp"><span class="t">:</span><span class="id">25</span></span>
+    <span class="tok"><span class="t">·</span><span class="id">220</span></span>
+  </div>
+
+  <p class="reveal">That is <strong>T = 25 tokens</strong>. The model's entire job is to predict the <em>26th</em> — the token that comes after the trailing space following <code>Sentiment:</code>. The output of this step is a plain list of 25 integers:</p>
+
+  <div class="eq reveal">
+    <span class="lbl">token id sequence</span>
+    ids = [9487, 1958, 262, 2420, 656, 8500, 11, 4633, 11, 393, 3967, 13, 8255, 25, 314, 892, 262, 14600, 318, 8788, 13, 11352, 3681, 25, 220]
+    <br><span class="dim">shape: (T,) = (25,)  — just integers, no meaning attached yet</span>
+  </div>
+
+  <div class="note reveal"><b>Why sub-words?</b> A pure word vocabulary can't handle typos, new words, or "vacationing." A pure character vocabulary makes sequences painfully long. BPE is the compromise: ~50k pieces that recombine to spell anything, keeping common words cheap and rare ones merely a few tokens.</div>
+</section>
+
+<!-- ================= EMBEDDING ================= -->
+<section id="embed">
+  <div class="step-no">Step 02 — Token embeddings</div>
+  <h2>Integers become <em>vectors</em>.</h2>
+  <p class="reveal">An integer like <code>8788</code> carries no relationships — <code>8788</code> isn't "more positive" than <code>4633</code>. So each ID is used to look up a row in the <em class="term">embedding matrix</em> <strong>E</strong>, a learned table with one 768-dimensional vector per vocabulary entry. This is a pure lookup: no multiplication, just indexing.</p>
+
+  <div class="eq reveal">
+    <span class="lbl">embedding matrix</span>
+    E ∈ ℝ<sup>50257 × 768</sup>   <span class="dim">— one learned row per token</span><br><br>
+    e<sub>i</sub> = E[ ids[i] ]   <span class="dim">— grab the row for token i</span><br><br>
+    <span class="qc">E[8788]</span> = [ 0.021, −0.114, 0.318, … , 0.077 ]   <span class="dim">(768 numbers, "okay")</span>
+  </div>
+
+  <figure class="reveal">
+    <div class="svgcard">
+    <svg viewBox="0 0 1000 320" role="img" aria-label="Embedding lookup">
+      <defs>
+        <marker id="arr2" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="#E8A23D"/></marker>
+      </defs>
+      <g font-family="JetBrains Mono" font-size="12">
+        <!-- the embedding matrix grid -->
+        <text x="60" y="36" fill="#9C988C" font-size="11">Embedding matrix E (50,257 × 768)</text>
+        <rect x="60" y="50" width="200" height="230" rx="6" fill="#0a0b0e" stroke="#54D1C4" stroke-width="1.2"/>
+        <!-- rows -->
+        <g>
+          <text x="20" y="74" fill="#6A6760" font-size="9">row 314</text>
+          <rect x="60" y="64" width="200" height="18" fill="#15171F" opacity="0.6"/>
+          <text x="14" y="120" fill="#6A6760" font-size="9">row 4633</text>
+          <rect x="60" y="110" width="200" height="18" fill="#15171F" opacity="0.6"/>
+          <text x="14" y="178" fill="#E8A23D" font-size="9">row 8788</text>
+          <rect x="60" y="168" width="200" height="18" fill="#E8A23D" opacity="0.85"/>
+          <text x="14" y="236" fill="#6A6760" font-size="9">row 3967</text>
+          <rect x="60" y="226" width="200" height="18" fill="#15171F" opacity="0.6"/>
+        </g>
+        <text x="160" y="178" fill="#1a1206" font-size="9" text-anchor="middle" font-weight="700">·okay → 768-d vector</text>
+        <text x="160" y="300" fill="#6A6760" font-size="9.5" text-anchor="middle">768 columns →</text>
+
+        <!-- arrow -->
+        <line x1="270" y1="177" x2="360" y2="177" stroke="#E8A23D" stroke-width="1.4" marker-end="url(#arr2)"/>
+
+        <!-- output stack of vectors -->
+        <text x="500" y="36" fill="#9C988C" font-size="11" text-anchor="middle">Embedded sequence  X ∈ ℝ²⁵ ˣ ⁷⁶⁸</text>
+        <g transform="translate(380,50)">
+          <g font-size="9.5" text-anchor="middle">
+            <rect x="0" y="0" width="500" height="22" rx="3" fill="#15171F" stroke="#54D1C4" stroke-width="0.8"/>
+            <text x="250" y="15" fill="#9C988C">e₀  "Class"   [0.04, −0.21, … , 0.13]</text>
+            <rect x="0" y="28" width="500" height="22" rx="3" fill="#15171F" stroke="#54D1C4" stroke-width="0.8"/>
+            <text x="250" y="43" fill="#9C988C">e₁  "ify"     [−0.12, 0.08, … , 0.30]</text>
+            <rect x="0" y="56" width="500" height="22" rx="3" fill="#0a0b0e" stroke="#6A6760" stroke-width="0.6" stroke-dasharray="3 3"/>
+            <text x="250" y="71" fill="#6A6760">⋮  (21 more rows)</text>
+            <rect x="0" y="84" width="500" height="22" rx="3" fill="#15171F" stroke="#54D1C4" stroke-width="0.8"/>
+            <text x="250" y="99" fill="#9C988C">e₁₉ "okay"    [0.021, −0.114, … , 0.077]</text>
+            <rect x="0" y="112" width="500" height="22" rx="3" fill="#1B1E28" stroke="#E8A23D" stroke-width="1.1"/>
+            <text x="250" y="127" fill="#E8A23D">e₂₄ "·"  ← last token, the one we'll predict from</text>
+          </g>
+        </g>
+        <text x="630" y="210" fill="#6A6760" font-size="9.5" text-anchor="middle">25 rows × 768 columns = 19,200 numbers</text>
+      </g>
+    </svg>
+    </div>
+    <figcaption>Each token ID indexes one row of E. Stacking all 25 rows gives the matrix X that flows into the transformer.</figcaption>
+  </figure>
+
+  <p class="reveal">Stacking the 25 looked-up vectors produces the first real tensor in the network:</p>
+  <div class="eq reveal">
+    <span class="lbl">embedded input</span>
+    X = stack(e<sub>0</sub>, e<sub>1</sub>, …, e<sub>24</sub>)<br>
+    X ∈ ℝ<sup>25 × 768</sup>   <span class="dim">— 25 token vectors, each 768-dimensional</span>
+  </div>
+  <div class="note reveal"><b>These vectors already mean something.</b> Because E is learned during training, words used in similar contexts end up near each other in this 768-d space. "okay," "fine," and "alright" sit close together; "vacation" lives near "holiday" and "trip." This is the raw material attention will mix.</div>
+</section>
+
+<!-- ================= POSITIONAL ================= -->
+<section id="pos">
+  <div class="step-no">Step 03 — Positional information</div>
+  <h2>Telling the model <em>where</em> each token sits.</h2>
+  <p class="reveal">There is a problem. The attention mechanism (next section) treats its input as a <em>set</em> — it has no built-in sense of order. Yet "vacation is okay" and "okay is vacation" must differ. The fix: add a <em class="term">positional vector</em> p<sub>i</sub> (also 768-d) to each token embedding, encoding its index in the sequence.</p>
+
+  <div class="eq reveal">
+    <span class="lbl">position-aware input</span>
+    x<sub>i</sub> = e<sub>i</sub> + p<sub>i</sub>      <span class="dim">— elementwise add, shape unchanged</span><br><br>
+    X<sub>0</sub> ∈ ℝ<sup>25 × 768</sup>   <span class="dim">— still 25 × 768, now order-aware</span>
+  </div>
+
+  <p class="reveal">Classic transformers build p<sub>i</sub> from sines and cosines of different frequencies, so each position gets a unique fingerprint the model can decode:</p>
+  <div class="eq reveal">
+    PE(pos, 2k)   = sin( pos / 10000<sup>2k/768</sup> )<br>
+    PE(pos, 2k+1) = cos( pos / 10000<sup>2k/768</sup> )<br>
+    <span class="dim">low dimensions oscillate fast (fine position), high dimensions slowly (coarse position)</span>
+  </div>
+  <div class="note reveal"><b>Modern variants.</b> Many current models replace this with <i>learned</i> position embeddings or <i>rotary</i> embeddings (RoPE), which rotate Q and K by an angle proportional to position. The principle is identical: inject order so attention can use it. From here on we carry one matrix, <code>X₀ ∈ ℝ²⁵ˣ⁷⁶⁸</code>, into the stack of transformer blocks.</div>
+</section>
+
+<!-- ================= ATTENTION ================= -->
+<section id="attention">
+  <div class="step-no">Step 04 — Self-attention · the core</div>
+  <h2><em>Attention</em> is all you need.</h2>
+  <p class="reveal">This is the engine. Each token asks every other token a question, reads their answers, and updates itself with a weighted blend of what it found relevant. The mechanism is built from three projections of the input — <span class="qc">Query</span>, <span class="kc">Key</span>, and <span class="vc">Value</span>.</p>
+
+  <div class="legend reveal">
+    <span><i style="background:var(--q)"></i> Q — Query: "what am I looking for?"</span>
+    <span><i style="background:var(--k)"></i> K — Key: "what do I offer?"</span>
+    <span><i style="background:var(--v)"></i> V — Value: "what do I contribute?"</span>
+  </div>
+
+  <h3>4.1 — Project X into Q, K, V</h3>
+  <p class="reveal">Three learned weight matrices turn each token vector into three new vectors. Within a single attention head these project down to 64 dimensions (768 ÷ 12 heads).</p>
+  <div class="eq reveal">
+    <span class="lbl">linear projections (per head)</span>
+    <span class="qc">Q</span> = X<sub>0</sub> <span class="qc">W<sub>Q</sub></span>     <span class="dim">W<sub>Q</sub> ∈ ℝ⁷⁶⁸ˣ⁶⁴   →   Q ∈ ℝ²⁵ˣ⁶⁴</span><br>
+    <span class="kc">K</span> = X<sub>0</sub> <span class="kc">W<sub>K</sub></span>     <span class="dim">W<sub>K</sub> ∈ ℝ⁷⁶⁸ˣ⁶⁴   →   K ∈ ℝ²⁵ˣ⁶⁴</span><br>
+    <span class="vc">V</span> = X<sub>0</sub> <span class="vc">W<sub>V</sub></span>     <span class="dim">W<sub>V</sub> ∈ ℝ⁷⁶⁸ˣ⁶⁴   →   V ∈ ℝ²⁵ˣ⁶⁴</span>
+  </div>
+
+  <figure class="reveal">
+    <div class="svgcard">
+    <svg viewBox="0 0 1000 220" role="img" aria-label="QKV projection">
+      <g font-family="JetBrains Mono" font-size="11.5" text-anchor="middle">
+        <rect x="60" y="70" width="120" height="80" rx="8" fill="#15171F" stroke="#9C988C" stroke-width="1.2"/>
+        <text x="120" y="105" fill="#ECE6D9">X₀</text>
+        <text x="120" y="125" fill="#6A6760" font-size="10">25 × 768</text>
+
+        <g stroke-width="1.3" fill="none">
+          <line x1="182" y1="95" x2="300" y2="55"  stroke="#E8A23D" marker-end="url(#arrQ)"/>
+          <line x1="182" y1="110" x2="300" y2="110" stroke="#54D1C4" marker-end="url(#arrK)"/>
+          <line x1="182" y1="125" x2="300" y2="165" stroke="#F47CA6" marker-end="url(#arrV)"/>
+        </g>
+        <defs>
+          <marker id="arrQ" markerWidth="8" markerHeight="8" refX="5" refY="3" orient="auto"><path d="M0,0 L5,3 L0,6Z" fill="#E8A23D"/></marker>
+          <marker id="arrK" markerWidth="8" markerHeight="8" refX="5" refY="3" orient="auto"><path d="M0,0 L5,3 L0,6Z" fill="#54D1C4"/></marker>
+          <marker id="arrV" markerWidth="8" markerHeight="8" refX="5" refY="3" orient="auto"><path d="M0,0 L5,3 L0,6Z" fill="#F47CA6"/></marker>
+        </defs>
+
+        <text x="245" y="48" fill="#E8A23D" font-size="9">×W_Q</text>
+        <text x="245" y="103" fill="#54D1C4" font-size="9">×W_K</text>
+        <text x="245" y="182" fill="#F47CA6" font-size="9">×W_V</text>
+
+        <rect x="305" y="35" width="100" height="42" rx="7" fill="#1B1E28" stroke="#E8A23D" stroke-width="1.3"/>
+        <text x="355" y="52" fill="#E8A23D">Q</text><text x="355" y="68" fill="#6A6760" font-size="9">25 × 64</text>
+        <rect x="305" y="90" width="100" height="42" rx="7" fill="#1B1E28" stroke="#54D1C4" stroke-width="1.3"/>
+        <text x="355" y="107" fill="#54D1C4">K</text><text x="355" y="123" fill="#6A6760" font-size="9">25 × 64</text>
+        <rect x="305" y="145" width="100" height="42" rx="7" fill="#1B1E28" stroke="#F47CA6" stroke-width="1.3"/>
+        <text x="355" y="162" fill="#F47CA6">V</text><text x="355" y="178" fill="#6A6760" font-size="9">25 × 64</text>
+
+        <!-- scores -->
+        <line x1="407" y1="55"  x2="470" y2="95" stroke="#9C988C" stroke-width="1.1" marker-end="url(#arrG)"/>
+        <line x1="407" y1="111" x2="470" y2="105" stroke="#9C988C" stroke-width="1.1" marker-end="url(#arrG)"/>
+        <defs><marker id="arrG" markerWidth="8" markerHeight="8" refX="5" refY="3" orient="auto"><path d="M0,0 L5,3 L0,6Z" fill="#9C988C"/></marker></defs>
+        <rect x="475" y="78" width="150" height="56" rx="8" fill="#15171F" stroke="#9C988C" stroke-width="1.2"/>
+        <text x="550" y="100" fill="#ECE6D9" font-size="11">QKᵀ / √64</text>
+        <text x="550" y="118" fill="#6A6760" font-size="9.5">scores  25 × 25</text>
+
+        <line x1="627" y1="106" x2="685" y2="106" stroke="#9C988C" stroke-width="1.1" marker-end="url(#arrG)"/>
+        <rect x="690" y="78" width="130" height="56" rx="8" fill="#15171F" stroke="#E8A23D" stroke-width="1.2"/>
+        <text x="755" y="100" fill="#E8A23D" font-size="11">softmax(rows)</text>
+        <text x="755" y="118" fill="#6A6760" font-size="9.5">weights 25 × 25</text>
+
+        <line x1="822" y1="106" x2="822" y2="106"/>
+        <path d="M755 136 L755 165 L500 165" stroke="#F47CA6" stroke-width="1.1" fill="none" marker-end="url(#arrV)"/>
+        <text x="630" y="160" fill="#F47CA6" font-size="9">weights · V</text>
+        <rect x="360" y="150" width="140" height="42" rx="8" fill="#1B1E28" stroke="#ECE6D9" stroke-width="1.3"/>
+        <text x="430" y="167" fill="#ECE6D9">output</text><text x="430" y="183" fill="#6A6760" font-size="9">25 × 64</text>
+      </g>
+    </svg>
+    </div>
+    <figcaption>The attention head: project to Q/K/V, score every query against every key, normalize to weights, blend the values.</figcaption>
+  </figure>
+
+  <h3>4.2 — Score: how much should each token attend to each other?</h3>
+  <p class="reveal">Take the dot product of every query with every key. A large dot product means "this key is relevant to my query." Dividing by √d<sub>head</sub> = √64 = 8 keeps the numbers from exploding (which would make the upcoming softmax too spiky).</p>
+  <div class="eq reveal">
+    <span class="lbl">scaled scores</span>
+    S = <span class="qc">Q</span> <span class="kc">Kᵀ</span> / √64<br>
+    <span class="dim">(25 × 64) · (64 × 25) = 25 × 25 — one score for every (query token, key token) pair</span>
+  </div>
+
+  <h3>4.3 — Causal mask: no peeking ahead</h3>
+  <p class="reveal">Because the model generates left-to-right, token <code>i</code> may only attend to tokens <code>≤ i</code>. Future positions are set to −∞ <em>before</em> the softmax, so they receive zero weight. This is why the last token — the one we predict from — can see the entire prompt, but not vice-versa.</p>
+  <div class="eq reveal">
+    <span class="lbl">apply causal mask</span>
+    S<sub>ij</sub> ← −∞   if j &gt; i      <span class="dim">— upper triangle blanked out</span>
+  </div>
+
+  <h3>4.4 — Softmax: turn scores into a distribution</h3>
+  <p class="reveal">Each row of S is squashed into positive weights that sum to 1. Now every token has a recipe: "I am X% token A, Y% token B…". Here is the actual softmax, applied row-wise:</p>
+  <div class="eq reveal big">
+    <span class="lbl">attention weights</span>
+    A<sub>ij</sub> = <span class="qc">exp(S<sub>ij</sub>)</span> / Σ<sub>k≤i</sub> exp(S<sub>ik</sub>)<br>
+    <span class="dim" style="font-size:12px">A ∈ ℝ²⁵ˣ²⁵, every row sums to exactly 1.0</span>
+  </div>
+
+  <p class="reveal">Let's make it concrete. Consider the <strong>last token's row</strong> — the position that decides the sentiment. Suppose its query, dotted against four key tokens, yields these scaled scores:</p>
+  <table class="reveal">
+    <tr><th>key token</th><th>·okay</th><th>·Sentiment:</th><th>·vacation</th><th>·think</th></tr>
+    <tr><td>score Sᵢⱼ</td><td>4.0</td><td>3.2</td><td>2.5</td><td>1.0</td></tr>
+    <tr><td>exp(Sᵢⱼ)</td><td>54.60</td><td>24.53</td><td>12.18</td><td>2.72</td></tr>
+    <tr><td>weight Aᵢⱼ</td><td style="color:var(--q)">0.581</td><td style="color:var(--q)">0.261</td><td>0.130</td><td>0.029</td></tr>
+  </table>
+  <p class="reveal">The model concentrates <strong>58% of its attention on "okay"</strong> and 26% on the <code>Sentiment:</code> cue — exactly the two tokens that determine the answer. The sum of all weights in the row is 1.000.</p>
+
+  <h3>4.5 — Weighted sum: gather the values</h3>
+  <p class="reveal">Finally, multiply the weights by V. Each token's output is the attention-weighted average of all value vectors — it has now "read" the rest of the sequence.</p>
+  <div class="eq reveal big">
+    <span class="lbl">attention output</span>
+    Attention(<span class="qc">Q</span>,<span class="kc">K</span>,<span class="vc">V</span>) = softmax( <span class="qc">Q</span><span class="kc">Kᵀ</span> / √d<sub>k</sub> ) <span class="vc">V</span><br>
+    <span class="dim" style="font-size:12px">(25 × 25) · (25 × 64) = 25 × 64 — one enriched vector per token</span>
+  </div>
+</section>
+
+<!-- ================= MULTIHEAD ================= -->
+<section id="multihead">
+  <div class="step-no">Step 05 — Multi-head attention</div>
+  <h2>Twelve perspectives at <em>once</em>.</h2>
+  <p class="reveal">One head learns one kind of relationship — maybe "adjective → noun." To capture syntax, coreference, sentiment cues and more simultaneously, the model runs <strong>12 independent heads in parallel</strong>, each with its own W<sub>Q</sub>, W<sub>K</sub>, W<sub>V</sub> projecting into a separate 64-d subspace. Their outputs are concatenated back to 768 and mixed by an output projection W<sub>O</sub>.</p>
+  <div class="eq reveal">
+    <span class="lbl">combine heads</span>
+    head<sub>h</sub> = Attention(X W<sub>Q</sub><sup>h</sup>, X W<sub>K</sub><sup>h</sup>, X W<sub>V</sub><sup>h</sup>)   <span class="dim">→ 25 × 64</span><br><br>
+    MultiHead = concat(head<sub>1</sub>, …, head<sub>12</sub>) W<sub>O</sub><br>
+    <span class="dim">concat → 25 × 768,   then × W<sub>O</sub> ∈ ℝ⁷⁶⁸ˣ⁷⁶⁸   →   25 × 768</span>
+  </div>
+
+  <figure class="reveal">
+    <div class="svgcard">
+    <svg viewBox="0 0 1000 200" role="img" aria-label="Multi-head attention">
+      <g font-family="JetBrains Mono" font-size="11" text-anchor="middle">
+        <rect x="30" y="78" width="90" height="44" rx="7" fill="#15171F" stroke="#9C988C"/>
+        <text x="75" y="98" fill="#ECE6D9">X₀</text><text x="75" y="113" fill="#6A6760" font-size="9">25×768</text>
+        <!-- fan out to heads -->
+        <g stroke="#6A6760" stroke-width="1" fill="none">
+          <line x1="122" y1="100" x2="200" y2="30"/><line x1="122" y1="100" x2="200" y2="70"/>
+          <line x1="122" y1="100" x2="200" y2="110"/><line x1="122" y1="100" x2="200" y2="170"/>
+        </g>
+        <g>
+          <rect x="200" y="18" width="120" height="26" rx="6" fill="#1B1E28" stroke="#E8A23D"/><text x="260" y="35" fill="#E8A23D" font-size="10">head 1 · 25×64</text>
+          <rect x="200" y="58" width="120" height="26" rx="6" fill="#1B1E28" stroke="#54D1C4"/><text x="260" y="75" fill="#54D1C4" font-size="10">head 2 · 25×64</text>
+          <rect x="200" y="98" width="120" height="26" rx="6" fill="#1B1E28" stroke="#F47CA6"/><text x="260" y="115" fill="#F47CA6" font-size="10">head 3 · 25×64</text>
+          <text x="260" y="148" fill="#6A6760" font-size="11">⋮</text>
+          <rect x="200" y="158" width="120" height="26" rx="6" fill="#1B1E28" stroke="#9C988C"/><text x="260" y="175" fill="#9C988C" font-size="10">head 12 · 25×64</text>
+        </g>
+        <!-- concat -->
+        <g stroke="#6A6760" stroke-width="1" fill="none">
+          <line x1="322" y1="31" x2="400" y2="100"/><line x1="322" y1="71" x2="400" y2="100"/>
+          <line x1="322" y1="111" x2="400" y2="100"/><line x1="322" y1="171" x2="400" y2="100"/>
+        </g>
+        <rect x="400" y="80" width="130" height="44" rx="7" fill="#15171F" stroke="#ECE6D9"/>
+        <text x="465" y="100" fill="#ECE6D9">concat</text><text x="465" y="115" fill="#6A6760" font-size="9">25×768</text>
+        <line x1="532" y1="102" x2="600" y2="102" stroke="#9C988C" marker-end="url(#arrG)"/>
+        <rect x="603" y="80" width="120" height="44" rx="7" fill="#1B1E28" stroke="#E8A23D"/>
+        <text x="663" y="100" fill="#E8A23D">× W_O</text><text x="663" y="115" fill="#6A6760" font-size="9">25×768</text>
+        <line x1="725" y1="102" x2="790" y2="102" stroke="#9C988C" marker-end="url(#arrG)"/>
+        <rect x="793" y="80" width="150" height="44" rx="7" fill="#15171F" stroke="#7FD17F"/>
+        <text x="868" y="100" fill="#7FD17F">attn output</text><text x="868" y="115" fill="#6A6760" font-size="9">25×768</text>
+      </g>
+    </svg>
+    </div>
+    <figcaption>12 heads run in parallel, each in its own 64-d subspace; outputs are concatenated and projected back to 768.</figcaption>
+  </figure>
+</section>
+
+<!-- ================= BLOCK ================= -->
+<section id="block">
+  <div class="step-no">Step 06 — The transformer block</div>
+  <h2>Attention, then <em>thinking</em>.</h2>
+  <p class="reveal">Attention <em>moves information between</em> tokens. The <em class="term">feed-forward network (FFN)</em> then <em>processes</em> each token independently — expanding to 3,072 dimensions, applying a non-linearity, and projecting back. Two glue components hold it together: <em class="term">residual connections</em> (add the input back, so gradients flow and information isn't lost) and <em class="term">layer normalization</em> (re-center and re-scale each vector for stable training).</p>
+
+  <div class="eq reveal">
+    <span class="lbl">one block (pre-norm form)</span>
+    X′ = X + MultiHead( LayerNorm(X) )          <span class="dim">— attention sub-layer + residual</span><br>
+    X″ = X′ + FFN( LayerNorm(X′) )              <span class="dim">— FFN sub-layer + residual</span>
+  </div>
+  <div class="eq reveal">
+    <span class="lbl">feed-forward network</span>
+    FFN(x) = GELU( x W<sub>1</sub> + b<sub>1</sub> ) W<sub>2</sub> + b<sub>2</sub><br>
+    <span class="dim">W<sub>1</sub> ∈ ℝ⁷⁶⁸ˣ³⁰⁷²  (expand)   ·   W<sub>2</sub> ∈ ℝ³⁰⁷²ˣ⁷⁶⁸  (contract)</span>
+  </div>
+
+  <figure class="reveal">
+    <div class="svgcard">
+    <svg viewBox="0 0 760 360" role="img" aria-label="Transformer block">
+      <g font-family="JetBrains Mono" font-size="11.5" text-anchor="middle">
+        <line x1="380" y1="10" x2="380" y2="350" stroke="#6A6760" stroke-width="1" stroke-dasharray="2 4" opacity="0.4"/>
+        <!-- input -->
+        <rect x="300" y="14" width="160" height="30" rx="7" fill="#15171F" stroke="#9C988C"/><text x="380" y="34" fill="#ECE6D9">X  (25×768)</text>
+        <!-- LN -->
+        <rect x="300" y="60" width="160" height="28" rx="7" fill="#1B1E28" stroke="#54D1C4"/><text x="380" y="79" fill="#54D1C4">LayerNorm</text>
+        <!-- attn -->
+        <rect x="280" y="104" width="200" height="34" rx="7" fill="#1B1E28" stroke="#E8A23D"/><text x="380" y="126" fill="#E8A23D">Multi-Head Attention</text>
+        <!-- residual add 1 -->
+        <circle cx="380" cy="166" r="13" fill="#15171F" stroke="#7FD17F"/><text x="380" y="171" fill="#7FD17F" font-size="14">+</text>
+        <!-- skip 1 -->
+        <path d="M300 29 L210 29 L210 166 L366 166" stroke="#7FD17F" stroke-width="1.1" fill="none" marker-end="url(#arrG2)"/>
+        <text x="150" y="100" fill="#7FD17F" font-size="9" text-anchor="middle">residual</text>
+        <!-- LN2 -->
+        <rect x="300" y="194" width="160" height="28" rx="7" fill="#1B1E28" stroke="#54D1C4"/><text x="380" y="213" fill="#54D1C4">LayerNorm</text>
+        <!-- FFN -->
+        <rect x="290" y="238" width="180" height="48" rx="7" fill="#1B1E28" stroke="#F47CA6"/>
+        <text x="380" y="258" fill="#F47CA6">Feed-Forward</text>
+        <text x="380" y="275" fill="#6A6760" font-size="9">768→3072→768 · GELU</text>
+        <!-- residual add 2 -->
+        <circle cx="380" cy="312" r="13" fill="#15171F" stroke="#7FD17F"/><text x="380" y="317" fill="#7FD17F" font-size="14">+</text>
+        <path d="M300 208 L210 208 L210 312 L366 312" stroke="#7FD17F" stroke-width="1.1" fill="none" marker-end="url(#arrG2)"/>
+        <!-- out -->
+        <rect x="300" y="338" width="160" height="20" rx="6" fill="#15171F" stroke="#9C988C"/><text x="380" y="352" fill="#ECE6D9" font-size="10">X″ → next block</text>
+        <!-- vertical arrows -->
+        <g stroke="#9C988C" stroke-width="1.1" fill="none" marker-end="url(#arrG2)">
+          <line x1="380" y1="44" x2="380" y2="58"/>
+          <line x1="380" y1="88" x2="380" y2="102"/>
+          <line x1="380" y1="138" x2="380" y2="152"/>
+          <line x1="380" y1="180" x2="380" y2="192"/>
+          <line x1="380" y1="222" x2="380" y2="236"/>
+          <line x1="380" y1="286" x2="380" y2="298"/>
+          <line x1="380" y1="326" x2="380" y2="337"/>
+        </g>
+        <defs><marker id="arrG2" markerWidth="8" markerHeight="8" refX="5" refY="3" orient="auto"><path d="M0,0 L5,3 L0,6Z" fill="#9C988C"/></marker></defs>
+      </g>
+    </svg>
+    </div>
+    <figcaption>One transformer block. The shape is preserved end to end: 25×768 in, 25×768 out — which is why blocks stack cleanly.</figcaption>
+  </figure>
+</section>
+
+<!-- ================= STACK ================= -->
+<section id="stack">
+  <div class="step-no">Step 07 — Depth</div>
+  <h2>Stack the block <em>twelve</em> times.</h2>
+  <p class="reveal">Because a block's output has the same shape as its input (25×768), blocks compose. The sequence passes through all 12, and the representations grow richer with depth: early layers track surface features (parts of speech, local phrases), middle layers assemble meaning, and late layers sharpen toward the specific prediction. By the final block, the last token's vector is a 768-d summary of "given everything above, what comes next?"</p>
+  <div class="eq reveal">
+    <span class="lbl">the full trunk</span>
+    X<sub>0</sub> → block₁ → block₂ → … → block₁₂ → X<sub>final</sub><br>
+    <span class="dim">X<sub>final</sub> ∈ ℝ²⁵ˣ⁷⁶⁸ — we only need its last row, X<sub>final</sub>[24]</span>
+  </div>
+  <div class="note reveal"><b>Parameter count, for intuition.</b> Each block holds ~7M parameters (attention + FFN); ×12 blocks + embeddings ≈ 124M total for GPT-2 small. A frontier model swaps these numbers for billions — wider d<sub>model</sub>, more heads, far more layers — but the operations on this page are exactly the same.</div>
+</section>
+
+<!-- ================= LOGITS / SOFTMAX ================= -->
+<section id="logits">
+  <div class="step-no">Step 08 — From vector to vocabulary</div>
+  <h2>Scoring <em>every</em> possible next word.</h2>
+  <p class="reveal">We now take just the <strong>last token's final vector</strong> and project it back to vocabulary space using the transpose of the embedding matrix (weight tying). This produces one <em class="term">logit</em> — an unnormalized score — for all 50,257 possible next tokens.</p>
+  <div class="eq reveal">
+    <span class="lbl">unembedding → logits</span>
+    z = X<sub>final</sub>[24] · Eᵀ      <span class="dim">(1 × 768) · (768 × 50257) = 1 × 50257</span><br>
+    <span class="dim">z is a score for every token; higher = "more likely to come next"</span>
+  </div>
+
+  <p class="reveal">A final softmax turns those 50,257 logits into a probability distribution. We only care about the three candidate tokens the instruction allowed — <code>·neutral</code>, <code>·positive</code>, <code>·negative</code> — whose logits dominate because the prompt steered the model there. Suppose the network produced:</p>
+  <table class="reveal">
+    <tr><th>candidate token</th><th>logit z</th><th>exp(z)</th><th>softmax probability</th></tr>
+    <tr><td style="color:var(--neu)">·neutral</td><td>7.9</td><td>2697.3</td><td style="color:var(--neu)">0.689  (68.9%)</td></tr>
+    <tr><td style="color:var(--pos)">·positive</td><td>7.1</td><td>1211.97</td><td style="color:var(--pos)">0.309  (30.9%)</td></tr>
+    <tr><td style="color:var(--neg)">·negative</td><td>2.0</td><td>7.39</td><td style="color:var(--neg)">0.002  (0.2%)</td></tr>
+  </table>
+  <div class="eq reveal big">
+    <span class="lbl">final softmax</span>
+    P(token<sub>t</sub>) = exp(z<sub>t</sub> / τ) / Σ<sub>v</sub> exp(z<sub>v</sub> / τ)<br>
+    <span class="dim" style="font-size:12px">τ = temperature. τ→0 makes it greedy (always the top token); τ&gt;1 flattens toward random.</span>
+  </div>
+  <p class="reveal">With greedy decoding the model emits <strong style="color:var(--neu)">·neutral</strong> — the right call for "I think the vacation is <em>okay</em>," a lukewarm verdict the model correctly reads as more neutral than positive. That token is appended, and if generation continued the whole 26-token sequence would flow back to Step 02. Here, the answer is complete.</p>
+
+  <!-- INTERACTIVE LAB -->
+  <div class="lab reveal">
+    <div class="head">Interactive · the temperature knob</div>
+    <h4>Watch the distribution breathe.</h4>
+    <p style="margin:0 0 4px;color:var(--muted);font-size:15px">These are the three candidate logits from above (7.9 / 7.1 / 2.0). Drag temperature τ and watch the softmax recompute live — low τ is decisive, high τ hedges. This is the single dial that separates "deterministic classifier" from "creative writer."</p>
+    <div class="slider-row">
+      <span>τ</span>
+      <input id="temp" type="range" min="0.1" max="2.5" step="0.05" value="1">
+      <span class="tval" id="tempVal">1.00</span>
+    </div>
+    <div class="bars" id="bars">
+      <div class="barrow"><span class="name" style="color:var(--neu)">neutral</span><div class="bartrack"><div class="barfill" id="f0" style="background:var(--neu)"></div></div><span class="barpct" id="p0"></span></div>
+      <div class="barrow"><span class="name" style="color:var(--pos)">positive</span><div class="bartrack"><div class="barfill" id="f1" style="background:var(--pos)"></div></div><span class="barpct" id="p1"></span></div>
+      <div class="barrow"><span class="name" style="color:var(--neg)">negative</span><div class="bartrack"><div class="barfill" id="f2" style="background:var(--neg)"></div></div><span class="barpct" id="p2"></span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= AGENT BRIDGE ================= -->
+<section id="agent">
+  <div class="step-no">Step 09 — Where the platform sits</div>
+  <h2>From a token to an <em>agent</em>.</h2>
+  <p class="reveal">Everything above is one forward pass — pure prediction, no will of its own. An orchestration layer (Dify, an MCP host, a Spring-Boot service calling the API) is what turns this into an <em>agent</em>: it builds the prompt, sends it through the forward pass, reads the output token(s), and decides what to do next — call a tool, query a RAG store, hand off to another step, or return the answer.</p>
+  <figure class="reveal">
+    <div class="svgcard">
+    <svg viewBox="0 0 1000 170" role="img" aria-label="Agent loop">
+      <g font-family="JetBrains Mono" font-size="11.5" text-anchor="middle">
+        <rect x="30" y="62" width="150" height="46" rx="9" fill="#15171F" stroke="#54D1C4"/><text x="105" y="82" fill="#ECE6D9">Orchestrator</text><text x="105" y="98" fill="#6A6760" font-size="9">Dify / MCP host</text>
+        <line x1="182" y1="85" x2="245" y2="85" stroke="#9C988C" marker-end="url(#arrG)"/><text x="213" y="76" fill="#6A6760" font-size="9">prompt</text>
+        <rect x="248" y="56" width="170" height="58" rx="9" fill="#1B1E28" stroke="#E8A23D"/><text x="333" y="80" fill="#E8A23D">LLM forward pass</text><text x="333" y="98" fill="#6A6760" font-size="9">everything on this page</text>
+        <line x1="420" y1="85" x2="483" y2="85" stroke="#9C988C" marker-end="url(#arrG)"/><text x="451" y="76" fill="#6A6760" font-size="9">token</text>
+        <rect x="486" y="62" width="150" height="46" rx="9" fill="#15171F" stroke="#F47CA6"/><text x="561" y="82" fill="#ECE6D9">Parse / route</text><text x="561" y="98" fill="#6A6760" font-size="9">tool? answer?</text>
+        <line x1="638" y1="85" x2="700" y2="85" stroke="#9C988C" marker-end="url(#arrG)"/>
+        <rect x="703" y="62" width="150" height="46" rx="9" fill="#15171F" stroke="#7FD17F"/><text x="778" y="82" fill="#ECE6D9">Tool / RAG</text><text x="778" y="98" fill="#6A6760" font-size="9">retrieve · act</text>
+        <path d="M778 110 L778 145 L105 145 L105 110" stroke="#54D1C4" stroke-width="1.1" fill="none" stroke-dasharray="4 5" marker-end="url(#arrG)"/>
+        <text x="440" y="162" fill="#54D1C4" font-size="9.5">results fold back into the next prompt — the agent loop</text>
+      </g>
+    </svg>
+    </div>
+    <figcaption>The agent loop. The LLM is the reasoning core; the orchestrator supplies context and acts on outputs.</figcaption>
+  </figure>
+  <div class="callout reveal">
+    <div class="h">The one-sentence summary</div>
+    <p style="margin:0">A prompt is split into tokens, each token becomes a 768-d learned vector, attention lets every token read every earlier token, twelve blocks refine those vectors, and the last vector is projected to a probability over 50,257 words — from which the next word is drawn. Repeat, and you have language. Wrap it in tools, and you have an agent.</p>
+  </div>
+</section>
+
+</div>
+
+<footer>
+  <div class="wrap">
+    <div class="big">"Attention lets each word decide, for itself, which other words matter."</div>
+    <div class="meta">forward pass · annotated · traced on GPT-2-class dimensions · 768 d &nbsp;·&nbsp; 12 heads &nbsp;·&nbsp; 12 layers</div>
+  </div>
+</footer>
+
+<script>
+  // progress bar
+  const prog=document.getElementById('progress');
+  addEventListener('scroll',()=>{
+    const h=document.documentElement;
+    const p=h.scrollTop/(h.scrollHeight-h.clientHeight);
+    prog.style.width=(p*100)+'%';
+  },{passive:true});
+
+  // reveal on scroll
+  const io=new IntersectionObserver((es)=>{
+    es.forEach(e=>{ if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target);} });
+  },{threshold:0.12, rootMargin:'0px 0px -8% 0px'});
+  document.querySelectorAll('.reveal').forEach((el,i)=>{
+    el.style.transitionDelay=(Math.min(i%4,3)*0.06)+'s';
+    io.observe(el);
+  });
+
+  // interactive softmax
+  const logits=[7.9,7.1,2.0];
+  const slider=document.getElementById('temp');
+  const tv=document.getElementById('tempVal');
+  function render(){
+    const t=parseFloat(slider.value);
+    tv.textContent=t.toFixed(2);
+    const ex=logits.map(z=>Math.exp(z/t));
+    const s=ex.reduce((a,b)=>a+b,0);
+    const probs=ex.map(e=>e/s);
+    for(let i=0;i<3;i++){
+      document.getElementById('f'+i).style.width=(probs[i]*100)+'%';
+      document.getElementById('p'+i).textContent=(probs[i]*100).toFixed(1)+'%';
+    }
+  }
+  slider.addEventListener('input',render);
+  render();
+</script>
+</body>
+</html>
